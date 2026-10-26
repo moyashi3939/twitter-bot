@@ -4,9 +4,10 @@ from __future__ import annotations
 import re
 from typing import Iterable, Optional
 
-# Nitter や Twitter/X など、ドメインが何であれ /ユーザー名/status/数字 の構造を持つURLをすべて拾う
+# ホストは問わない: twitter.com / x.com / fx系 / Nitter(任意のインスタンス)すべて
+# 「/ユーザー名/status/数字」の形をツイートURLとみなす
 _STATUS_RE = re.compile(
-    r"https?://[^/]+/(?P<user>[^/?#]+)/status(?:es)?/(?P<id>\d+)"
+    r"https?://[^/\s]+/(?P<user>[^/?#\s]+)/status(?:es)?/(?P<id>\d+)"
 )
 
 
@@ -17,10 +18,11 @@ def extract_status_id(link: str) -> Optional[str]:
 
 
 def to_fixed_url(link: str, domain: str = "fxtwitter.com") -> str:
-    """任意のツイートURL（NitterやTwitter等）を FixTweet 系ドメインに差し替える。
+    """ツイートURL(twitter.com / x.com / Nitter など)を FixTweet 系ドメインに差し替える。
 
     Discord が画像・動画・引用・翻訳付きの綺麗な埋め込みを作ってくれるようになる。
     ツイートURLでなければ元のリンクをそのまま返す。
+    追跡用のクエリ(?s=20 など)は落とす。
     """
     m = _STATUS_RE.search(link or "")
     if not m:
@@ -43,3 +45,22 @@ def order_oldest_first(entries: Iterable) -> list:
     if items and all(ids):
         items = [e for _, e in sorted(zip(map(int, ids), items), key=lambda p: p[0])]
     return items
+
+
+# --- リツイート / 返信の判定(タイトルの書き出しで見分ける) ---
+# Nitter: 「RT by @アカウント: 本文」「R to @相手: 本文」
+# RSS.app など: 「RT @元アカウント: 本文」「@相手 本文」
+_RT_RE = re.compile(r"^\s*RT\s+(?:by\s+)?@", re.IGNORECASE)
+_REPLY_RE = re.compile(r"^\s*(?:R\s+to\s+@|@\w)", re.IGNORECASE)
+
+
+def is_retweet(title: str) -> bool:
+    return bool(_RT_RE.match(title or ""))
+
+
+def is_reply(title: str) -> bool:
+    return bool(_REPLY_RE.match(title or ""))
+
+
+def should_skip(title: str, skip_retweets: bool = True, skip_replies: bool = True) -> bool:
+    return (skip_retweets and is_retweet(title)) or (skip_replies and is_reply(title))

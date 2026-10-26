@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 from typing import List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 import asyncpg
@@ -11,7 +12,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
-from tweets import entry_key, order_oldest_first, to_fixed_url
+from tweets import entry_key, order_oldest_first, should_skip, to_fixed_url
 
 load_dotenv()
 
@@ -19,11 +20,17 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 # FixTweet 系ドメイン。fxtwitter.com / fixupx.com / vxtwitter.com など
 FIX_DOMAIN = os.getenv("FIX_DOMAIN", "fxtwitter.com")
-POLL_MINUTES = int(os.getenv("POLL_MINUTES", "5"))
+# RSSを確認する間隔(秒)。短いほど速いが、公開Nitterは回数が多いと制限されやすい
+POLL_SECONDS = max(30, int(os.getenv("POLL_SECONDS") or float(os.getenv("POLL_MINUTES", "1")) * 60))
 # 1フィード・1回のチェックで送る最大件数(超えた分は次回に持ち越す。取りこぼしはしない)
 MAX_SEND_PER_CYCLE = int(os.getenv("MAX_SEND_PER_CYCLE", "20"))
 # 連投時の送信間隔(秒)。Discordのレート制限と通知のうるささ対策
 SEND_INTERVAL = float(os.getenv("SEND_INTERVAL", "1.0"))
+# リツイート・返信を通知しない(0 にすると通知する)
+SKIP_RETWEETS = os.getenv("SKIP_RETWEETS", "1") != "0"
+SKIP_REPLIES = os.getenv("SKIP_REPLIES", "1") != "0"
+# Nitterが落ちたときの予備インスタンス(カンマ区切り)。例: https://nitter.example.com,https://nitter.example.org
+NITTER_FALLBACKS = [u.strip() for u in os.getenv("NITTER_FALLBACKS", "").split(",") if u.strip()]
 # 既読として DB に残す件数(フィードごと)
 KEEP_SEEN = 500
 
@@ -34,14 +41,69 @@ HTTP_TIMEOUT = aiohttp.ClientTimeout(total=20)
 HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; rss-discord-bot/2.0)"}
 
 
-async def fetch_entries(session: aiohttp.ClientSession, url: str) -> list:
-    """RSSを取得してエントリ一覧(新しい順)を返す。失敗時は例外。"""
-    async with session.get(url) as resp:
+def candidate_urls(url: str) -> List[str]:
+    """本来のURL + (Nitter形式 /ユーザー名/rss なら)予備インスタンスに差し替えたURL。"""
+    urls = [url]
+    parts = urlsplit(url)
+    if NITTER_FALLBACKS and parts.path.rstrip("/").endswith("/rss"):
+        for base in NITTER_FALLBACKS:
+            b = urlsplit(base)
+            if b.netloc and b.netloc != parts.netloc:
+                urls.append(urlunsplit((b.scheme or "https", b.netloc, parts.path, parts.query, "")))
+    return urls
+
+
+# URLごとの (ETag, Last-Modified, エントリ)。変更なしなら 304 で軽く済ませ、前回の中身を使う
+_http_cache: dict = {}
+# 元のURL → 最後に取得できたURL(予備インスタンスに切り替わったら、次回から先に試す)
+_preferred: dict = {}
+
+
+async def _fetch_one(session: aiohttp.ClientSession, url: str) -> list:
+    cached = _http_cache.get(url)
+    headers = {}
+    if cached:
+        if cached[0]:
+            headers["If-None-Match"] = cached[0]
+        if cached[1]:
+            headers["If-Modified-Since"] = cached[1]
+
+    async with session.get(url, headers=headers) as resp:
+        if resp.status == 304 and cached:
+            return cached[2]
         resp.raise_for_status()
         xml_data = await resp.text()
+        etag = resp.headers.get("ETag")
+        last_modified = resp.headers.get("Last-Modified")
+
     # feedparser は同期処理なのでスレッドに逃がす
     parsed = await asyncio.to_thread(feedparser.parse, xml_data)
-    return list(parsed.entries)
+    if not parsed.entries and parsed.bozo:
+        raise ValueError("RSSとして読み取れませんでした")
+    entries = list(parsed.entries)
+    if etag or last_modified:
+        _http_cache[url] = (etag, last_modified, entries)
+    return entries
+
+
+async def fetch_entries(session: aiohttp.ClientSession, url: str) -> list:
+    """RSSを取得してエントリ一覧(新しい順)を返す。Nitterは予備インスタンスへ自動で切り替える。"""
+    candidates = candidate_urls(url)
+    preferred = _preferred.get(url)
+    if preferred in candidates:
+        candidates.remove(preferred)
+        candidates.insert(0, preferred)
+
+    last_error: Exception = RuntimeError("no url")
+    for candidate in candidates:
+        try:
+            entries = await _fetch_one(session, candidate)
+            _preferred[url] = candidate
+            return entries
+        except Exception as e:
+            last_error = e
+            log.info("fetch failed: %s (%s)", candidate, e)
+    raise last_error
 
 
 def key_of(entry) -> str:
@@ -162,6 +224,15 @@ class RSSBot(commands.Bot):
                 return
             fresh = order_oldest_first(fresh)
 
+            # リツイート・返信は送らず、既読だけ付ける(毎回判定し直さないため)
+            skipped = [e for e in fresh if should_skip(getattr(e, "title", ""), SKIP_RETWEETS, SKIP_REPLIES)]
+            if skipped:
+                await self._mark_seen(conn, feed_id, [key_of(e) for e in skipped])
+                skipped_keys = {key_of(e) for e in skipped}
+                fresh = [e for e in fresh if key_of(e) not in skipped_keys]
+            if not fresh:
+                return
+
             channel = await self._resolve_channel(feed["channel_id"])
             if channel is None:
                 log.warning("channel %s not found (feed %s)", feed["channel_id"], feed_id)
@@ -211,7 +282,7 @@ class RSSBot(commands.Bot):
 
             await asyncio.gather(*(run(f) for f in feeds))
 
-    @tasks.loop(minutes=POLL_MINUTES)
+    @tasks.loop(seconds=POLL_SECONDS)
     async def check_rss(self):
         await self.process_rss_check()
 
@@ -275,7 +346,7 @@ def _can_post(channel: discord.TextChannel) -> Optional[str]:
 
 
 @bot.tree.command(name="follow", description="RSSフィードをチャンネルに登録します")
-@app_commands.describe(rss_url="RSS.appで生成したURL", channel="通知を送るチャンネル")
+@app_commands.describe(rss_url="RSSのURL(RSSHub / Nitterなど)", channel="通知を送るチャンネル")
 @app_commands.guild_only()
 @app_commands.check(is_admin_or_owner)
 async def follow(interaction: discord.Interaction, rss_url: str, channel: discord.TextChannel):
