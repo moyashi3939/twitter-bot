@@ -451,6 +451,39 @@ async def list_feeds(interaction: discord.Interaction):
     text = "\n".join(f"<#{r['channel_id']}> ← {r['rss_url']}" for r in rows)
     await interaction.response.send_message(text[:1900], ephemeral=True)
 
+import logging
+import requests
+
+# ==========================================
+# 1. Discord Webhookへの送信設定
+# ==========================================
+WEBHOOK_URL = "https://discord.com/api/webhooks/1565167248874930186/87sKl9hIN4Cy6rjtJ1m-YHw-er2DRwHPO0ojRt4LoMt78epv1TymdaWNHiEWNpMm4e1D"
+
+class DiscordHandler(logging.Handler):
+    def emit(self, record):
+        log_entry = self.format(record)
+        # Discordの文字数制限（2000文字）対策
+        if len(log_entry) > 1900:
+            log_entry = log_entry[:1900] + "..."
+            
+        # エラーのときは強調表示をつける
+        prefix = "🚨 **エラー発生**\n" if record.levelno >= logging.ERROR else ""
+        payload = {"content": f"{prefix}```\n{log_entry}\n```"}
+        
+        try:
+            requests.post(WEBHOOK_URL, json=payload, timeout=5)
+        except Exception:
+            pass
+
+# ロガーの初期設定
+logger = logging.getLogger("BotLogger")
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:
+    handler = DiscordHandler()
+    handler.setFormatter(logging.Formatter("[%(levelname)s] %(asctime)s: %(message)s"))
+    logger.addHandler(handler)
+
 
 if __name__ == "__main__":
     if not TOKEN:
